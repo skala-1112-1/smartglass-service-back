@@ -1,169 +1,278 @@
 import cv2
 import torch
-import gc
+import numpy as np
 from PIL import Image
-from transformers import pipeline
+from pathlib import Path
+from transformers import OwlViTProcessor, OwlViTForObjectDetection
+from transformers import CLIPProcessor, CLIPModel
 
-_detector = None
+# --- 전역 모델 캐싱 (싱글톤 패턴) ---
+_owl_processor = None
+_owl_model = None
+_clip_processor = None
+_clip_model = None
+_device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def get_detector():
-    global _detector
-    if _detector is None:
-        # CPU 환경(Device: -1)에서도 최대한 효율적으로 작동하도록 설정
-        _detector = pipeline(
-            "zero-shot-object-detection",
-            model="google/owlvit-base-patch32",
-            device=-1 
-        )
-        print("[MODEL] 사물 인식 AI 로드 완료")
-    return _detector
+def load_models():
+    """
+    모델을 최초 1회만 로드하고, GPU 사용 시 FP16(반정밀도)을 적용해 속도를 극대화합니다.
+    """
+    global _owl_processor, _owl_model, _clip_processor, _clip_model
 
+    if _owl_model is None:
+        print(f"[SYSTEM] 모델 로딩 및 최적화 시작 (Device: {_device})...")
+        
+        # 1. OwlViT (탐지)
+        _owl_processor = OwlViTProcessor.from_pretrained("google/owlvit-base-patch32")
+        _owl_model = OwlViTForObjectDetection.from_pretrained("google/owlvit-base-patch32").to(_device)
+        
+        # 2. CLIP (상태 분류)
+        _clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        _clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(_device)
+
+        # GPU 가속 (FP16 적용 - 속도 3배 향상)
+        if _device == "cuda":
+            _owl_model.half()
+            _clip_model.half()
+            print("[SYSTEM] GPU 가속(FP16) 활성화 완료.")
+        else:
+            print("[SYSTEM] CPU 모드로 실행됩니다. (속도가 느릴 수 있음)")
+
+def get_monitor_status(pil_image, box):
+    """
+    CLIP을 사용하여 모니터의 화면이 켜져있는지(ON) 꺼져있는지(OFF) 판별합니다.
+    Unknown을 방지하기 위해 시각적 묘사 프롬프트를 사용합니다.
+    """
+    width, height = pil_image.size
+    x1, y1, x2, y2 = box
+    # 좌표 보정
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(width, int(x2)), min(height, int(y2))
+
+    if x2 <= x1 or y2 <= y1: return "OFF", 0.0
+
+    try:
+        cropped_img = pil_image.crop((x1, y1, x2, y2))
+        
+        # [핵심] Unknown 제거를 위한 직관적 프롬프트
+        prompts = [
+            "a computer screen displaying colorful content",  # ON
+            "a black blank computer screen"                 # OFF
+        ]
+        
+        inputs = _clip_processor(text=prompts, images=cropped_img, return_tensors="pt", padding=True).to(_device)
+
+        if _device == "cuda":
+            inputs["pixel_values"] = inputs["pixel_values"].half()
+
+        with torch.no_grad():
+            outputs = _clip_model(**inputs)
+        
+        probs = outputs.logits_per_image.softmax(dim=1)
+        probs_np = probs.cpu().float().numpy()[0]
+        
+        # ON 확률이 더 높으면 ON, 아니면 OFF
+        if probs_np[0] > probs_np[1]:
+            return "ON", probs_np[0]
+        else:
+            return "OFF", probs_np[1]
+
+    except Exception:
+        return "OFF", 0.0
+
+# ---------------------------------------------------------
+# 1. 실시간 카메라 연동 함수 (라우터 호출용)
+# ---------------------------------------------------------
 def run_realtime_inspection(camera_index=0):
-    detector = get_detector()
+    """
+    웹캠을 열어 실시간으로 탐지하고, 'q'를 누르면 종료 시점의 결과(Dict)를 반환합니다.
+    """
+    load_models()
+    
     cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(camera_index)
     
-    # 탐지 대상 정의 (Monitor 상태 구분 추가)
-    items_to_track = {
-        "Cell Phone": "a mobile smartphone",
-        "Water Purifier": "a water dispenser machine",
-        "Tumbler": "a drinking tumbler",
-        "Monitor": "a computer monitor screen" # 기본 모니터 탐지용
-    }
+    # 탐지 설정
+    texts = [["a mobile smartphone", "a water dispenser", "a tumbler", "a computer monitor"]]
+    labels_map = ["Cell Phone", "Water Purifier", "Tumbler", "Monitor"]
     
-    # 상태 판단용 프롬프트
-    monitor_states = ["the screen of a monitor is turned on", "the screen of a monitor is turned off"]
+    # 최종 반환할 결과 데이터
+    final_results = {key: "WAITING" for key in labels_map}
+    final_results["Monitor"] = "OFF"
     
-    candidate_labels = list(items_to_track.values()) + monitor_states
-    inspection_results = {key: "WAITING" for key in items_to_track.keys()}
-    inspection_results["Monitor"] = "OFF" # 기본값은 OFF
+    print("[INFO] 실시간 점검 시작 (화면의 'q'를 누르면 종료하고 결과를 전송합니다)")
 
-    print(f"[INFO] 모니터 ON/OFF 포함 점검 시작")
+    frame_count = 0
+    skip_frames = 2  # 성능 최적화를 위한 프레임 스킵
+    last_detections = [] 
 
-    while cap.isOpened():
+    while True:
         ret, frame = cap.read()
         if not ret: break
-
+        
+        frame_count += 1
         display_frame = frame.copy()
-        inf_frame = cv2.resize(frame, (640, 640))
-        pil_img = Image.fromarray(cv2.cvtColor(inf_frame, cv2.COLOR_BGR2RGB))
 
-        results = detector(pil_img, candidate_labels=candidate_labels)
+        # --- 추론 (3프레임당 1회) ---
+        if frame_count % (skip_frames + 1) == 0:
+            last_detections = []
+            h, w, _ = frame.shape
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(rgb_frame)
 
-        # 이번 프레임에서 발견된 모니터들의 상태를 저장할 임시 리스트
-        current_monitor_on = False
+            inputs = _owl_processor(text=texts, images=pil_img, return_tensors="pt").to(_device)
+            if _device == "cuda":
+                inputs["pixel_values"] = inputs["pixel_values"].half()
 
-        for res in results:
-            score = res["score"]
-            label_desc = res["label"]
+            with torch.no_grad():
+                outputs = _owl_model(**inputs)
+
+            target_sizes = torch.Tensor([[h, w]]).to(_device)
+            results = _owl_processor.post_process_object_detection(outputs, threshold=0.1, target_sizes=target_sizes)[0]
+
+            found_monitor = False
             
-            if score > 0.12:
-                # 1. 일반 사물 탐지 (폰, 정수기, 텀블러)
-                for key, desc in items_to_track.items():
-                    if label_desc == desc:
-                        if key != "Monitor": # 모니터 외 사물은 PASS/WAITING
-                            inspection_results[key] = "PASS"
+            for box, score, label_idx in zip(results["boxes"], results["scores"], results["labels"]):
+                label_text = labels_map[label_idx]
+                box_cpu = box.tolist()
                 
-                # 2. 모니터 상태 탐지
-                if label_desc == "the screen of a monitor is turned on":
-                    current_monitor_on = True
-                    inspection_results["Monitor"] = "ON"
-                elif label_desc == "the screen of a monitor is turned off" and not current_monitor_on:
-                    # ON이 감지되지 않았을 때만 OFF로 유지
-                    inspection_results["Monitor"] = "OFF"
-
-                # 시각화 (화면 표시)
-                h, w, _ = frame.shape
-                box = res["box"]
-                x1, y1 = int(box["xmin"] * w / 640), int(box["ymin"] * h / 640)
-                x2, y2 = int(box["xmax"] * w / 640), int(box["ymax"] * h / 640)
+                status_suffix = ""
+                color = (255, 255, 0) # 기본 노란색
                 
-                # 라벨 텍스트 가공 (너무 길면 보기 힘드므로 짧게 출력)
-                display_label = label_desc if "monitor" not in label_desc else "Monitor"
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(display_frame, f"{display_label} ({int(score*100)}%)", (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # 1. 모니터 상태 확인
+                if label_text == "Monitor":
+                    status, conf = get_monitor_status(pil_img, box_cpu)
+                    final_results["Monitor"] = status # 결과 업데이트
+                    status_suffix = f": {status}"
+                    color = (0, 255, 0) if status == "ON" else (0, 0, 255)
+                    found_monitor = True
+                
+                # 2. 일반 사물 확인
+                else:
+                    final_results[label_text] = "PASS" # 발견되면 PASS 처리
+                
+                last_detections.append({
+                    "box": box_cpu,
+                    "label": label_text,
+                    "suffix": status_suffix,
+                    "score": score.item(),
+                    "color": color
+                })
 
-        # 좌측 상단 상태 메뉴 표시
-        for i, (item, status) in enumerate(inspection_results.items()):
-            color = (0, 255, 0) if status in ["PASS", "ON"] else (0, 0, 255)
-            cv2.putText(display_frame, f"{item}: {status}", (20, 40 + (i*30)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        # --- 그리기 (매 프레임) ---
+        for det in last_detections:
+            x1, y1, x2, y2 = map(int, det["box"])
+            text = f"{det['label']}{det['suffix']} ({det['score']:.2f})"
+            cv2.rectangle(display_frame, (x1, y1), (x2, y2), det["color"], 2)
+            cv2.putText(display_frame, text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, det["color"], 2)
 
-        cv2.imshow("Smart Glass AI - Monitor Check", display_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
+        # 상태 패널 UI
+        for i, (k, v) in enumerate(final_results.items()):
+            c = (0, 255, 0) if v in ["PASS", "ON"] else (0, 0, 255)
+            if v == "WAITING": c = (180, 180, 180)
+            cv2.putText(display_frame, f"{k}: {v}", (10, 30 + i*30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, c, 2)
+
+        cv2.imshow("Real-time Inspection (Press 'q' to save & exit)", display_frame)
+        
+        # 'q'를 누르면 루프 종료하고 현재 상태 반환
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
 
     cap.release()
     cv2.destroyAllWindows()
-    return inspection_results
+    
+    # 라우터로 최종 결과 딕셔너리 반환
+    return final_results
 
+
+# ---------------------------------------------------------
+# 2. 영상 파일 처리 함수 (라우터 호출용)
+# ---------------------------------------------------------
 def process_video_detection(input_path: str, output_path: str) -> dict:
+    """
+    업로드된 비디오 파일을 읽어 분석 후 결과 영상을 저장합니다.
+    (실시간 탐지와 동일한 최적화 로직 적용)
+    """
     try:
-        detector = get_detector()
-        cap = cv2.VideoCapture(input_path)
+        load_models() # 모델 로드
         
+        cap = cv2.VideoCapture(input_path)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+        # 코덱 설정
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-        # 탐지 라벨 및 상태 정의
-        items_to_track = {
-            "Cell Phone": "a mobile smartphone",
-            "Water Purifier": "a water dispenser machine",
-            "Tumbler": "a drinking tumbler",
-            "Monitor": "a computer monitor screen"
-        }
-        monitor_states = ["the screen of a monitor is turned on", "the screen of a monitor is turned off"]
-        candidate_labels = list(items_to_track.values()) + monitor_states
         
+        texts = [["a mobile smartphone", "a water dispenser", "a tumbler", "a computer monitor"]]
+        labels_map = ["Cell Phone", "Water Purifier", "Tumbler", "Monitor"]
+        
+        total_detections_count = 0
         frame_count = 0
+        last_detections = [] # 그리기용 캐시
 
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret: break
             frame_count += 1
+            
+            # 파일 처리는 2프레임마다 1번 추론 (속도/품질 타협)
+            if frame_count % 2 == 1:
+                last_detections = []
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                pil_img = Image.fromarray(rgb_frame)
+                
+                inputs = _owl_processor(text=texts, images=pil_img, return_tensors="pt").to(_device)
+                if _device == "cuda":
+                    inputs["pixel_values"] = inputs["pixel_values"].half()
+                
+                with torch.no_grad():
+                    outputs = _owl_model(**inputs)
+                
+                target_sizes = torch.Tensor([[height, width]]).to(_device)
+                results = _owl_processor.post_process_object_detection(outputs, threshold=0.1, target_sizes=target_sizes)[0]
+                
+                for box, score, label_idx in zip(results["boxes"], results["scores"], results["labels"]):
+                    if score < 0.12: continue
+                    
+                    label_text = labels_map[label_idx]
+                    box_cpu = box.tolist()
+                    status_suffix = ""
+                    color = (0, 255, 0)
+                    
+                    if label_text == "Monitor":
+                        status, _ = get_monitor_status(pil_img, box_cpu)
+                        status_suffix = f": {status}"
+                        color = (0, 255, 0) if status == "ON" else (0, 0, 255)
+                    
+                    last_detections.append({
+                        "box": box_cpu,
+                        "text": f"{label_text}{status_suffix}",
+                        "color": color
+                    })
+                    total_detections_count += 1
 
-            if frame_count % 3 == 1:
-                inf_frame = cv2.resize(frame, (640, 640))
-                pil_img = Image.fromarray(cv2.cvtColor(inf_frame, cv2.COLOR_BGR2RGB))
-                raw_results = detector(pil_img, candidate_labels=candidate_labels)
-                last_results = [res for res in raw_results if res["score"] > 0.15]
-
-            current_monitor_status = "OFF"
-            # 모니터 ON 여부 우선 확인
-            for res in last_results:
-                if res["label"] == "the screen of a monitor is turned on":
-                    current_monitor_status = "ON"
-
-            for res in last_results:
-                box = res["box"]
-                score = res["score"]
-                label_desc = res["label"]
-
-                # 좌표 복구
-                x1 = int(box["xmin"] * width / 640)
-                y1 = int(box["ymin"] * height / 640)
-                x2 = int(box["xmax"] * width / 640)
-                y2 = int(box["ymax"] * height / 640)
-
-                # 라벨 표시 로직
-                if "monitor" in label_desc:
-                    display_text = f"Monitor: {current_monitor_status}"
-                else:
-                    # 일반 사물 이름 찾기
-                    display_text = next((k for k, v in items_to_track.items() if v == label_desc), "Object")
-
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                cv2.putText(frame, f"{display_text} ({int(score*100)}%)", (x1, y1-10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # 그리기
+            for det in last_detections:
+                x1, y1, x2, y2 = map(int, det["box"])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), det["color"], 3)
+                cv2.putText(frame, det["text"], (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, det["color"], 2)
 
             out.write(frame)
-        
+
         cap.release()
         out.release()
-        return {"status": "success", "processed_frames": frame_count, "message": "파일 분석 완료"}
         
+        return {
+            "status": "success",
+            "message": "영상 분석 완료",
+            "processed_frames": frame_count,
+            "total_detections": total_detections_count
+        }
+
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return {"status": "error", "message": str(e)}
