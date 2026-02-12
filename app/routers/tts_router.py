@@ -12,6 +12,7 @@ TTS_DIR = BASE_DIR / "app" / "static" / "tts"
 @router.get("/machine")
 async def get_tts_voices(machine_id: str):
     items = get_checklist(machine_id)
+    print(items)
     if not items:
         raise HTTPException(status_code=404, detail="체크리스트를 찾을 수 없습니다")
     
