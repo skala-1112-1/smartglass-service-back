@@ -5,6 +5,7 @@ from PIL import Image
 from pathlib import Path
 from transformers import OwlViTProcessor, OwlViTForObjectDetection
 from transformers import CLIPProcessor, CLIPModel
+from collections import deque
 
 # --- 전역 모델 캐싱 (싱글톤 패턴) ---
 _owl_processor = None
@@ -38,6 +39,30 @@ def load_models():
         else:
             print("[SYSTEM] CPU 모드로 실행됩니다. (속도가 느릴 수 있음)")
 
+def analyze_screen_cv(pil_image):
+    """
+    전통적 CV 기법으로 밝기와 복잡도 분석
+    Return: 'ON'일 확률 가산점 (0.0 ~ 0.3)
+    """
+    # PIL -> OpenCV (RGB -> BGR -> Gray)
+    img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2GRAY)
+    
+    # 1. 분산(Variance) 체크: 화면이 켜져있으면 색 변화가 심함
+    # 꺼진 화면은 전체적으로 어두워서 분산이 낮음
+    variance = np.var(img)
+    
+    # 2. 엣지(Edge) 체크: 글자나 아이콘이 있는지
+    edges = cv2.Canny(img, 100, 200)
+    edge_score = np.count_nonzero(edges) / edges.size # 전체 픽셀 중 엣지 비율
+    
+    cv_score = 0.0
+    
+    # 임계값은 환경에 따라 조절 필요 (경험적 수치)
+    if variance > 500: cv_score += 0.1
+    if edge_score > 0.02: cv_score += 0.1 # 2% 이상이 엣지면 내용이 있다고 판단
+    
+    return cv_score
+
 def get_monitor_status(pil_image, box):
     """
     CLIP을 사용하여 모니터의 화면이 켜져있는지(ON) 꺼져있는지(OFF) 판별합니다.
@@ -45,43 +70,55 @@ def get_monitor_status(pil_image, box):
     """
     width, height = pil_image.size
     x1, y1, x2, y2 = box
-    # 좌표 보정
     x1, y1 = max(0, int(x1)), max(0, int(y1))
     x2, y2 = min(width, int(x2)), min(height, int(y2))
-
+    
     if x2 <= x1 or y2 <= y1: return "OFF", 0.0
 
-    try:
-        cropped_img = pil_image.crop((x1, y1, x2, y2))
+    cropped_img = pil_image.crop((x1, y1, x2, y2))
+    
+    # 프롬프트 앙상블
+    positive_prompts = [
+        "a computer screen showing windows desktop",
+        "a glowing monitor displaying content",
+        "a bright lcd screen with text"
+    ]
+    negative_prompts = [
+        "a black blank monitor screen",
+        "a dark glass surface",
+        "a reflection on a turned off screen"
+    ]
+    
+    all_prompts = positive_prompts + negative_prompts
+    
+    inputs = _clip_processor(text=all_prompts, images=cropped_img, return_tensors="pt", padding=True).to(_device)
+    if _device == "cuda":
+        inputs["pixel_values"] = inputs["pixel_values"].half()
         
-        # [핵심] Unknown 제거를 위한 직관적 프롬프트
-        prompts = [
-            "a computer screen displaying colorful content",  # ON
-            "a black blank computer screen"                 # OFF
-        ]
+    with torch.no_grad():
+        outputs = _clip_model(**inputs)
         
-        inputs = _clip_processor(text=prompts, images=cropped_img, return_tensors="pt", padding=True).to(_device)
+    # 확률 계산 (Softmax)
+    probs = outputs.logits_per_image.softmax(dim=1).cpu().float().numpy()[0]
+    
+    # 긍정 그룹 평균 vs 부정 그룹 평균
+    avg_on_score = np.mean(probs[:3]) 
+    avg_off_score = np.mean(probs[3:])
+    
+    
+    cv_bonus = analyze_screen_cv(cropped_img)
+    
+    final_on_score = avg_on_score + cv_bonus
+    
+    # 최종 판단
+    if final_on_score > avg_off_score:
+        return "ON", final_on_score
+    else:
+        return "OFF", avg_off_score
 
-        if _device == "cuda":
-            inputs["pixel_values"] = inputs["pixel_values"].half()
-
-        with torch.no_grad():
-            outputs = _clip_model(**inputs)
-        
-        probs = outputs.logits_per_image.softmax(dim=1)
-        probs_np = probs.cpu().float().numpy()[0]
-        
-        # ON 확률이 더 높으면 ON, 아니면 OFF
-        if probs_np[0] > probs_np[1]:
-            return "ON", probs_np[0]
-        else:
-            return "OFF", probs_np[1]
-
-    except Exception:
-        return "OFF", 0.0
 
 # ---------------------------------------------------------
-# 1. 실시간 카메라 연동 함수 (라우터 호출용)
+# 1. 실시간 카메라 연동 함수
 # ---------------------------------------------------------
 def run_realtime_inspection(camera_index=0):
     """
@@ -187,7 +224,7 @@ def run_realtime_inspection(camera_index=0):
 
 
 # ---------------------------------------------------------
-# 2. 영상 파일 처리 함수 (라우터 호출용)
+# 2. 영상 파일 처리 함수
 # ---------------------------------------------------------
 def process_video_detection(input_path: str, output_path: str) -> dict:
     """
