@@ -126,9 +126,56 @@ def run_realtime_inspection(camera_index=0):
     """
     load_models()
     
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
+    # macOS와 Windows에서 다른 백엔드 사용
+    import platform
+    
+    print(f"[INFO] 운영체제: {platform.system()}")
+    
+    if platform.system() == "Darwin":  # macOS
+        print("[INFO] macOS 카메라 초기화 중...")
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_AVFOUNDATION)
+        if not cap.isOpened():
+            print("[INFO] AVFoundation 실패, 기본 백엔드로 시도...")
+            cap = cv2.VideoCapture(camera_index)
+    elif platform.system() == "Windows":
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(camera_index)
+    else:  # Linux
         cap = cv2.VideoCapture(camera_index)
+    
+    # 카메라가 열리지 않으면 다른 인덱스 시도
+    if not cap.isOpened():
+        print(f"[ERROR] 카메라 인덱스 {camera_index}에서 카메라를 열 수 없습니다.")
+        print("[INFO] 다른 카메라 인덱스 시도 중...")
+        
+        for i in range(5):  # 0~4번 인덱스 시도
+            if platform.system() == "Darwin":
+                cap = cv2.VideoCapture(i, cv2.CAP_AVFOUNDATION)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(i)
+            elif platform.system() == "Windows":
+                cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(i)
+            else:
+                cap = cv2.VideoCapture(i)
+            
+            if cap.isOpened():
+                ret, _ = cap.read()  # 실제 프레임 읽기 테스트
+                if ret:
+                    print(f"[INFO] 카메라 인덱스 {i}에서 카메라를 찾았습니다.")
+                    camera_index = i
+                    break
+                else:
+                    cap.release()
+        else:
+            print("[ERROR] 사용 가능한 카메라를 찾을 수 없습니다.")
+            print("해결 방법:")
+            print("1. macOS 시스템 설정 → 개인정보 보호 및 보안 → 카메라에서 터미널 권한 허용")
+            print("2. 다른 앱에서 카메라 사용 중인지 확인 (FaceTime, PhotoBooth 등)")
+            print("3. 외장 웹캠 연결 시도")
+            return None
     
     # 탐지 설정
     texts = [["a mobile smartphone", "a water dispenser", "a tumbler", "a computer monitor"]]
