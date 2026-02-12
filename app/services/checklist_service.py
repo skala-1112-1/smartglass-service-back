@@ -1,6 +1,10 @@
 import os
 import openai
 from dotenv import load_dotenv
+from sqlalchemy.orm import Session
+from app.database import get_db
+from app.models import Checklist
+from typing import List, Dict
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -26,21 +30,52 @@ CHECKLISTS = {
     ],
 }
 
-def get_checklist(machine_id: str):
+def get_checklist(machine_id: str, db: Session = None) -> List[Dict]:
+    """
+    데이터베이스에서 특정 machine_id의 체크리스트를 조회합니다.
+    db가 None이면 메모리에서 조회합니다 (백업용).
+    """
+    if db is not None:
+        try:
+            checklists = db.query(Checklist).filter(Checklist.machine_id == machine_id).all()
+            return [checklist.to_dict() for checklist in checklists]
+        except Exception as e:
+            print(f"DB 조회 중 오류 발생: {e}, 메모리에서 조회합니다.")
+    
+    # 백업: 메모리에서 조회
     return CHECKLISTS.get(machine_id, [])
 
-def update_checklist_item(machine_id: str, item_index: int, done: bool) -> bool:
+def update_checklist_item(machine_id: str, item_index: int, done: bool, db: Session = None) -> bool:
     """
-    특정 체크리스트 항목의 done 상태를 업데이트합니다.
+    데이터베이스에서 특정 체크리스트 항목의 done 상태를 업데이트합니다.
+    db가 None이면 메모리에서 업데이트합니다 (백업용).
     
     Args:
         machine_id: 기계 ID
         item_index: 체크리스트 항목 인덱스
         done: 완료 상태
+        db: 데이터베이스 세션
         
     Returns:
         bool: 업데이트 성공 여부
     """
+    if db is not None:
+        try:
+            item = db.query(Checklist).filter(
+                Checklist.machine_id == machine_id,
+                Checklist.item_index == item_index
+            ).first()
+            
+            if item:
+                item.done = done
+                db.commit()
+                return True
+            return False
+        except Exception as e:
+            db.rollback()
+            print(f"DB 업데이트 중 오류 발생: {e}, 메모리에서 업데이트합니다.")
+    
+    # 백업: 메모리에서 업데이트
     if machine_id not in CHECKLISTS:
         return False
         
