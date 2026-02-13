@@ -1,12 +1,13 @@
 services:
   postgres:
-    image: postgres:15
+    image: pgvector/pgvector:pg15
     container_name: smartglass-postgres
     restart: always
     environment:
+      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
-      - "5432:5432"
+      - "5433:5433"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -26,6 +27,7 @@ services:
       - postgres
     networks:
       - smartglass-network
+
 
 volumes:
   postgres_data:
