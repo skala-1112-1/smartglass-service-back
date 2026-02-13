@@ -27,10 +27,22 @@ services:
       - postgres
     networks:
       - smartglass-network
-
+  # Redis (캐싱 및 세션 저장소)
+  redis:
+    image: redis:7.4-alpine
+    container_name: smartglass-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    networks:
+      - smartglass-network
 
 volumes:
   postgres_data:
+  redis_data:
 
 networks:
   smartglass-network:
