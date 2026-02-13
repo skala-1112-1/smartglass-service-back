@@ -17,5 +17,10 @@ roboflow
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.9
 
+# vectorDB dependencies
+pgvector==0.4.2
+sentence_transformers
+pypdf
+
 # Redis dependencies
 redis==5.1.1
