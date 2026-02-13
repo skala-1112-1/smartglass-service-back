@@ -6,6 +6,11 @@ from app.database import get_db
 from app.models import Checklist
 from typing import List, Dict
 
+# --- [추가된 Import] Vector DB & Embedding 관련 ---
+from app.database import get_db
+from app.models import Checklist
+from app.services.vector_db_service import SessionLocal, KnowledgeBase, get_embedding # Vector DB 모델
+
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
@@ -87,12 +92,51 @@ def update_checklist_item(machine_id: str, item_index: int, done: bool, db: Sess
             
     return False
 
+def retrieve_knowledge(query: str, limit: int = 3) -> str:
+    """
+    질문(query)과 관련된 지식(문서, 용어)을 Vector DB에서 찾아 텍스트로 반환합니다.
+    """
+    db = SessionLocal()
+    try:
+        # 1. 질문을 벡터로 변환 (384차원)
+        query_vector = get_embedding(query)
+        
+        # 2. DB에서 코사인 유사도가 가장 높은 데이터 검색
+        results = db.query(KnowledgeBase).order_by(
+            KnowledgeBase.embedding.cosine_distance(query_vector)
+        ).limit(limit).all()
+        
+        if not results:
+            return "관련된 내부 지식 문서가 없습니다."
+
+        # 3. 검색된 내용을 하나의 문자열로 합침
+        context_text = ""
+        for idx, res in enumerate(results, 1):
+            source_info = f"[{res.category}] {res.source}"
+            context_text += f"{idx}. 출처: {source_info}\n   내용: {res.content}\n"
+            if res.metadata_info:
+                context_text += f"   참고: {res.metadata_info}\n"
+            context_text += "\n"
+            
+        return context_text
+        
+    except Exception as e:
+        print(f"RAG 검색 실패: {e}")
+        return "지식 검색 중 오류 발생"
+    finally:
+        db.close()
+
+
+
 def generate_report(machine_id: str, transcripts: dict) -> str:
     checklist = get_checklist(machine_id)
     
     # 점검 완료/미완료 항목 분류
     completed = []
     not_completed = []
+
+    # RAG 검색을 위한 키워드 수집
+    search_keywords = [f"{machine_id} 안전 점검"]
     
     for item in checklist:
         idx = item["index"]
@@ -106,6 +150,16 @@ def generate_report(machine_id: str, transcripts: dict) -> str:
         else:
             not_completed.append(f"{idx}. {todo}")
     
+    # 2. [RAG] Vector DB 검색 실행
+    # 기계 이름과 주요 점검 항목을 합쳐서 DB에 물어봅니다.
+    rag_query = " ".join(search_keywords[:3]) # 너무 길면 잘림 방지
+    print(f"[RAG] 검색 쿼리: {rag_query}")
+    
+    retrieved_context = retrieve_knowledge(rag_query, limit=3)
+    print(f"[RAG] 검색 결과:\n{retrieved_context}")
+
+
+
     print(transcripts)
     print('--')
     print(completed)
@@ -118,6 +172,12 @@ def generate_report(machine_id: str, transcripts: dict) -> str:
 - 믹싱기(1): NMP(N-Methyl-2-pyrrolidone) 등 유기용제 사용, 화재/폭발 위험, 유해물질 노출 위험
 - 코터(2): 고온 건조로, 롤러 압착, NMP 증발, 기계적 위험 및 화학적 위험 복합
 - 슬리터(3): 고속 회전 칼날, 기계적 위험, 정밀 절단 공정
+
+---
+### 
+아래 내용은 Vector DB에서 검색된 실제 사내 지식입니다. 보고서 작성 시 적극 인용하세요.
+{retrieved_context}
+---
 
 **실제 점검 데이터:**
 """

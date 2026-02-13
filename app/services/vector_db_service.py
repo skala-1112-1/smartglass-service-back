@@ -1,9 +1,7 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, func
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector
-import os
-
+from sentence_transformers import SentenceTransformer
 
 
 # ====================================================================
@@ -27,48 +25,81 @@ import os
 # ====================================================================
 
 
-# 1. DB 연결 설정
-# 포맷: postgresql://아이디:비번@주소:포트/DB이름
-DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/vector_db"
+# DB 연결 (포트 5433 유지)
+DATABASE_URL = "postgresql://postgres:postgres@localhost:5433/postgres"
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# 2. 모델 정의 (테이블과 매핑)
-class DetectionLog(Base):
-    __tablename__ = "detection_logs"
+class KnowledgeBase(Base):
+    """
+    전문 용어, 통번역 데이터, 보고서용 문서 조각을 저장하는 테이블
+    """
+    __tablename__ = "knowledge_base"
 
     id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
-    object_name = Column(String)
-    status = Column(String)
-    confidence = Column(Float)
-    # CLIP-ViT-Base-32는 512차원입니다.
-    embedding = Column(Vector(512)) 
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # category: 'TERM'(용어), 'TRANS'(번역), 'DOC'(보고서 문서)
+    category = Column(String(50)) 
+    
+    # source: 파일명이나 출처 (예: '2024_manual.pdf', 'user_input')
+    source = Column(String(255))
+    
+    # content: 실제 텍스트 내용 (질문이나 문서의 본문)
+    content = Column(Text)
+    
+    # answer: (선택) 통번역이나 용어집일 경우 짝이 되는 정답/번역문
+    metadata_info = Column(Text, nullable=True) 
 
-# 테이블 자동 생성 (이미 DBeaver로 만들었으면 생략 가능하지만 안전을 위해 둠)
+    # ★ 중요: 한국어 텍스트 임베딩 모델(MiniLM)은 384차원입니다.
+    embedding = Column(Vector(384))
+
+# 테이블 생성
 Base.metadata.create_all(bind=engine)
 
-# 3. 데이터 저장 함수
-def save_detection_log(object_name, status, confidence, embedding_list):
-    """
-    탐지 결과를 DB에 저장합니다.
-    embedding_list: List[float]
-    """
+def save_knowledge(category, source, content, embedding, metadata_info=None):
     session = SessionLocal()
     try:
-        log = DetectionLog(
-            object_name=object_name,
-            status=status,
-            confidence=confidence,
-            embedding=embedding_list
+        doc = KnowledgeBase(
+            category=category,
+            source=source,
+            content=content,
+            metadata_info=metadata_info,
+            embedding=embedding
         )
-        session.add(log)
+        session.add(doc)
         session.commit()
-        # print(f"[DB] Saved: {object_name} ({status})")
     except Exception as e:
-        print(f"[DB Error] {e}")
         session.rollback()
+        raise e
     finally:
         session.close()
+
+
+## 텍스트 임베딩
+
+
+# 전역 변수로 모델 로드 (최초 1회만)
+_text_model = None
+
+def get_text_model():
+    global _text_model
+    if _text_model is None:
+        print("[MODEL] 텍스트 임베딩 모델 로딩 중... (multilingual-MiniLM-L12-v2)")
+        # 한국어와 영어를 동시에 잘하는 가볍고 빠른 모델입니다.
+        _text_model = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+    return _text_model
+
+def get_embedding(text: str):
+    """
+    문자열을 입력받아 384차원의 실수 리스트(Vector)로 변환
+    """
+    model = get_text_model()
+    # numpy array -> list 변환
+    vector = model.encode(text).tolist()
+    return vector
+
+
+## 업로드 및 API 검색

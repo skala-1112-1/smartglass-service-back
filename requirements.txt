@@ -17,3 +17,5 @@ roboflow
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.9
 pgvector==0.4.2
+sentence_transformers
+pypdf
