@@ -6,6 +6,8 @@ from pathlib import Path
 from transformers import OwlViTProcessor, OwlViTForObjectDetection
 from transformers import CLIPProcessor, CLIPModel
 from collections import deque
+import time
+from app.cache.services.detection_cache import detection_cache_service
 
 # --- 전역 모델 캐싱 (싱글톤 패턴) ---
 _owl_processor = None
@@ -138,7 +140,11 @@ def run_realtime_inspection(camera_index=0):
     final_results = {key: "WAITING" for key in labels_map}
     final_results["Monitor"] = "OFF"
     
+    # 체크리스트 업데이트용 타이머
+    last_checklist_update = 0
+    
     print("[INFO] 실시간 점검 시작 (화면의 'q'를 누르면 종료하고 결과를 전송합니다)")
+    print("[INFO] Monitor ON 감지시 2초마다 체크리스트를 자동 업데이트합니다")
 
     frame_count = 0
     skip_frames = 2  # 성능 최적화를 위한 프레임 스킵
@@ -184,6 +190,16 @@ def run_realtime_inspection(camera_index=0):
                     status_suffix = f": {status}"
                     color = (0, 255, 0) if status == "ON" else (0, 0, 255)
                     found_monitor = True
+                    
+                    # Monitor가 ON이고 2초가 지났으면 체크리스트 업데이트
+                    current_time = time.time()
+                    if status == "ON" and (current_time - last_checklist_update) >= 2.0:
+                        try:
+                            result = detection_cache_service.process_detection("4", 1, True)
+                            print(f"[INFO] 체크리스트 업데이트: {result}")
+                            last_checklist_update = current_time
+                        except Exception as e:
+                            print(f"[ERROR] 체크리스트 업데이트 실패: {e}")
                 
                 # 2. 일반 사물 확인
                 else:
