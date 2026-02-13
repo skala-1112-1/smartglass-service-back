@@ -19,6 +19,9 @@ CHECKLISTS = {
         {"index": 1, "todo": "원형 칼날의 마모나 파손 상태가 없나요?", "done": False, "summary": "설비 무결성 유지"},
         {"index": 2, "todo": "칼날 교체 시 전원이 완전히 차단(LOTO)되었나요?", "done": False, "summary": "안전 작업 절차 준수"},
     ],
+    "4": [  # 모니터
+        {"index": 1, "todo": "모니터 화면 전원이 잘 들어오나요?", "done": False, "summary": "시스템 상태 점검"},
+    ]
 }
 
 def init_database():
