@@ -16,3 +16,6 @@ roboflow
 # PostgreSQL dependencies
 sqlalchemy==2.0.36
 psycopg2-binary==2.9.9
+
+# Redis dependencies
+redis==5.1.1
