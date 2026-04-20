@@ -67,7 +67,7 @@ PYTHONPATH=. python app/init_db.py
 OPENAI_API_KEY에는 보유한 api key를 넣어야 합니다.
 
 ```
-OPENAI_API_KEY=your_actual_api_key_here
+OPENAI_API_KEY=your_actual_api_key
 ```
 
 ## 실행 방법
